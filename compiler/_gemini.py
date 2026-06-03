@@ -12,7 +12,11 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class StructuredGenerationError(RuntimeError):
-    """Raised when Gemini output cannot be parsed or validated against a schema."""
+    """Raised when Gemini output cannot be parsed as JSON."""
+
+    def __init__(self, message: str, *, raw_text: str | None = None) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
 
 
 def generate_structured(
@@ -39,15 +43,9 @@ def generate_structured(
     try:
         payload = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        # Phase 3: JSON repair engine will plug in here.
         raise StructuredGenerationError(
-            f"Failed to parse Gemini JSON output: {exc}"
+            f"Failed to parse Gemini JSON output: {exc}",
+            raw_text=raw_text,
         ) from exc
 
-    try:
-        return response_schema.model_validate(payload)
-    except ValidationError as exc:
-        # Phase 3: schema repair / re-prompt will plug in here.
-        raise StructuredGenerationError(
-            f"Gemini output failed schema validation: {exc}"
-        ) from exc
+    return response_schema.model_validate(payload)
