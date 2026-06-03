@@ -1,0 +1,29 @@
+# Environments
+.env
+venv/
+env/
+__pycache__/
+*.pyc
+
+# IDEs and OS
+.vscode/
+.idea/
+.DS_Store
+.cursor/
+
+# Generated Database (Don't commit the SQLite file)
+*.db
+*.sqlite
+*.sqlite3
+app.db
+
+# Generated JSON Outputs (Don't commit your test runs)
+test_output.json
+compiled_app.json
+
+# Streamlit
+.streamlit/
+
+# Testing / Logs
+.pytest_cache/
+*.log
