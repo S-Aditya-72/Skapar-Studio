@@ -5,12 +5,12 @@ from __future__ import annotations
 import re
 
 from dsl import APISchema, DatabaseSchema, UISchema
-from dsl.api_schema import Endpoint
+from dsl.api_schema import Endpoint, HttpMethod, SchemaField
+from dsl.schema_helpers import payload_api_field_names, schema_field_names
 from dsl.ui_schema import Component, ComponentType
 
 _PATH_PARAM_PATTERN = re.compile(r"^\{[a-zA-Z_][a-zA-Z0-9_]*\}$")
 
-# Request/response fields commonly used by auth flows but not stored as columns.
 _AUTH_OR_METADATA_FIELDS = frozenset({
     "email",
     "password",
@@ -25,7 +25,6 @@ _AUTH_OR_METADATA_FIELDS = frozenset({
     "error",
 })
 
-# Path prefixes that are not required to map to a database table.
 _EXEMPT_PATH_PREFIXES = (
     "/auth",
     "/health",
@@ -35,6 +34,13 @@ _EXEMPT_PATH_PREFIXES = (
     "/me",
 )
 
+_COMPONENT_METHOD_PRIORITY: dict[ComponentType, tuple[HttpMethod, ...]] = {
+    ComponentType.TABLE: (HttpMethod.GET,),
+    ComponentType.FORM: (HttpMethod.POST, HttpMethod.PUT),
+    ComponentType.BUTTON: (HttpMethod.POST, HttpMethod.DELETE, HttpMethod.PUT),
+    ComponentType.TEXT: (HttpMethod.GET,),
+}
+
 
 class CrossLayerValidationError(Exception):
     """Raised when two DSL layers disagree in ways Pydantic alone cannot detect."""
@@ -43,7 +49,7 @@ class CrossLayerValidationError(Exception):
 def validate_ui_against_api(ui_schema: UISchema, api_schema: APISchema) -> None:
     """Ensure UI components only bind to endpoints that exist in the API schema."""
     endpoint_paths = {endpoint.path for endpoint in api_schema.endpoints}
-    endpoints_by_path = {endpoint.path: endpoint for endpoint in api_schema.endpoints}
+    endpoints_by_path = _group_endpoints_by_path(api_schema.endpoints)
 
     page_routes = {page.route for page in ui_schema.pages}
 
@@ -65,13 +71,20 @@ def validate_ui_against_api(ui_schema: UISchema, api_schema: APISchema) -> None:
             )
 
 
+def _group_endpoints_by_path(endpoints: list[Endpoint]) -> dict[str, list[Endpoint]]:
+    grouped: dict[str, list[Endpoint]] = {}
+    for endpoint in endpoints:
+        grouped.setdefault(endpoint.path, []).append(endpoint)
+    return grouped
+
+
 def _validate_component_endpoint_binding(
     component: Component,
     *,
     page_name: str,
     page_route: str,
     endpoint_paths: set[str],
-    endpoints_by_path: dict[str, Endpoint],
+    endpoints_by_path: dict[str, list[Endpoint]],
 ) -> None:
     binding = component.api_endpoint_binding
 
@@ -92,21 +105,109 @@ def _validate_component_endpoint_binding(
             f"Available endpoint paths: {sorted(endpoint_paths)}"
         )
 
-    endpoint = endpoints_by_path[binding]
-    request_keys = set(endpoint.request_schema.keys()) if endpoint.request_schema else set()
+    endpoints_at_path = endpoints_by_path[binding]
+    endpoint = _resolve_bound_endpoint(component, endpoints_at_path)
+    request_keys = schema_field_names(endpoint.request_schema)
 
-    for ui_field, api_field in component.payload_mapping.items():
-        if api_field not in request_keys:
+    for mapping in component.payload_mapping or []:
+        if mapping.api_field_name not in request_keys:
+            methods_at_path = [
+                f"{ep.method.value} {ep.path}" for ep in endpoints_at_path]
             raise CrossLayerValidationError(
-                f"Component '{component.id}' on page '{page_name}' maps UI field "
-                f"'{ui_field}' to API key '{api_field}', but endpoint '{binding}' "
-                f"request_schema keys are {sorted(request_keys) or '(empty)'}."
+                f"Component '{component.id}' on page '{page_name}' maps UI input "
+                f"'{mapping.ui_input_name}' to API field '{mapping.api_field_name}', but "
+                f"resolved endpoint '{endpoint.method.value} {binding}' request_schema "
+                f"fields are {sorted(request_keys) or '(none)'}. "
+                f"Endpoints at this path: {methods_at_path}."
             )
+
+
+def _resolve_bound_endpoint(
+    component: Component,
+    endpoints_at_path: list[Endpoint],
+) -> Endpoint:
+    if len(endpoints_at_path) == 1:
+        return endpoints_at_path[0]
+
+    candidates = _candidates_for_component_type(
+        component.type, endpoints_at_path)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    mapped_fields = payload_api_field_names(component.payload_mapping)
+    if mapped_fields:
+        compatible = [
+            endpoint
+            for endpoint in candidates
+            if mapped_fields.issubset(schema_field_names(endpoint.request_schema))
+        ]
+        if len(compatible) == 1:
+            return compatible[0]
+        if len(compatible) > 1:
+            picked = _select_by_method_priority(component.type, compatible)
+            if picked is not None:
+                return picked
+            raise CrossLayerValidationError(
+                f"Component '{component.id}' (type={component.type.value}) binds to path "
+                f"'{endpoints_at_path[0].path}' but payload_mapping is compatible with "
+                f"multiple endpoints: "
+                f"{', '.join(ep.method.value for ep in compatible)}."
+            )
+
+    picked = _select_by_method_priority(component.type, candidates)
+    if picked is not None:
+        return picked
+
+    methods = ", ".join(
+        endpoint.method.value for endpoint in endpoints_at_path)
+    preferred = _COMPONENT_METHOD_PRIORITY.get(component.type, ())
+    raise CrossLayerValidationError(
+        f"Component '{component.id}' (type={component.type.value}) binds to path "
+        f"'{endpoints_at_path[0].path}' but cannot resolve an endpoint among "
+        f"methods [{methods}]. Disambiguate with payload_mapping. "
+        f"Preferred methods for this component type: "
+        f"{', '.join(method.value for method in preferred) or 'none'}."
+    )
+
+
+def _candidates_for_component_type(
+    component_type: ComponentType,
+    endpoints_at_path: list[Endpoint],
+) -> list[Endpoint]:
+    allowed_methods = set(_COMPONENT_METHOD_PRIORITY.get(component_type, ()))
+    if not allowed_methods:
+        return endpoints_at_path
+
+    filtered = [
+        endpoint for endpoint in endpoints_at_path if endpoint.method in allowed_methods]
+    if not filtered:
+        methods = ", ".join(
+            endpoint.method.value for endpoint in endpoints_at_path)
+        preferred = ", ".join(
+            method.value for method in _COMPONENT_METHOD_PRIORITY[component_type])
+        raise CrossLayerValidationError(
+            f"No endpoint at path '{endpoints_at_path[0].path}' uses an HTTP method "
+            f"appropriate for component type {component_type.value}. "
+            f"Available methods: [{methods}]. Expected one of: [{preferred}]."
+        )
+    return filtered
+
+
+def _select_by_method_priority(
+    component_type: ComponentType,
+    candidates: list[Endpoint],
+) -> Endpoint | None:
+    for method in _COMPONENT_METHOD_PRIORITY.get(component_type, ()):
+        for endpoint in candidates:
+            if endpoint.method == method:
+                return endpoint
+    return None
 
 
 def validate_api_against_db(api_schema: APISchema, db_schema: DatabaseSchema) -> None:
     """Sanity-check API endpoints against the database schema."""
-    tables = {table.name: {column.name for column in table.columns} for table in db_schema.tables}
+    tables = {table.name: {column.name for column in table.columns}
+              for table in db_schema.tables}
     all_columns: set[str] = set()
     for columns in tables.values():
         all_columns |= columns
@@ -158,7 +259,6 @@ def _is_exempt_path(path: str) -> bool:
 
 
 def _resource_segment_from_path(path: str) -> str | None:
-    """Return the first non-parameter path segment (e.g. '/users/{id}' -> 'users')."""
     segments = [segment for segment in path.strip("/").split("/") if segment]
     for segment in segments:
         if not _PATH_PARAM_PATTERN.match(segment):
@@ -167,7 +267,6 @@ def _resource_segment_from_path(path: str) -> str | None:
 
 
 def _resolve_table_name(resource: str, tables: dict[str, set[str]]) -> str | None:
-    """Map a URL resource segment to a database table name when possible."""
     if resource in tables:
         return resource
 
@@ -193,21 +292,20 @@ def _validate_schema_fields_against_table(
     *,
     endpoint: Endpoint,
     field_source: str,
-    fields: dict[str, object],
+    fields: list[SchemaField] | None,
     table_name: str,
     table_columns: set[str],
     all_columns: set[str],
 ) -> None:
-    if not fields:
+    if fields is None:
         return
 
-    for field_name in fields:
+    for schema_field in fields:
+        field_name = schema_field.field_name
         if field_name in table_columns or field_name in _AUTH_OR_METADATA_FIELDS:
             continue
 
         if field_name in all_columns:
-            # Field exists on another table — allowed for joins/aggregates but flagged only
-            # when it is completely unknown across the schema.
             continue
 
         raise CrossLayerValidationError(

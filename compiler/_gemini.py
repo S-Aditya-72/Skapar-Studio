@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 from typing import TypeVar
 
-import google.generativeai as genai
-from pydantic import BaseModel, ValidationError
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -20,25 +21,30 @@ class StructuredGenerationError(RuntimeError):
 
 
 def generate_structured(
-    model: genai.GenerativeModel,
+    client: genai.Client,
     *,
+    model: str,
     prompt: str,
     response_schema: type[T],
     temperature: float = 0.2,
 ) -> T:
     """Call Gemini with JSON mode and validate the response against a Pydantic model."""
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.GenerationConfig(
-            temperature=temperature,
-            response_mime_type="application/json",
-            response_schema=response_schema,
-        ),
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        response_mime_type="application/json",
+        response_schema=response_schema,
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=config,
     )
 
     raw_text = response.text
     if not raw_text:
-        raise StructuredGenerationError("Gemini returned an empty response body.")
+        raise StructuredGenerationError(
+            "Gemini returned an empty response body.")
 
     try:
         payload = json.loads(raw_text)

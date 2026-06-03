@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from compiler._gemini import generate_structured
 from compiler._runtime import get_runtime
+from compiler.schema_helpers import get_gemini_schema
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -27,7 +28,7 @@ def repair_json(
     context_str: str = "",
 ) -> T:
     """Ask Gemini to minimally repair JSON so it validates against target_model."""
-    model = get_runtime().model
+    runtime = get_runtime()
 
     prompt = _REPAIR_PROMPT_TEMPLATE.format(
         bad_json=bad_json,
@@ -36,8 +37,9 @@ def repair_json(
     )
 
     return generate_structured(
-        model,
+        runtime.client,
+        model=runtime.model_name,
         prompt=prompt,
-        response_schema=target_model,
+        response_schema=get_gemini_schema(target_model),
         temperature=0.1,
     )

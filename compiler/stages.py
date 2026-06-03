@@ -2,49 +2,12 @@
 
 from __future__ import annotations
 
-import json
-
 from pydantic import BaseModel, ConfigDict, Field
 
 from compiler._gemini import StructuredGenerationError, generate_structured
 from compiler._runtime import get_runtime
-from dsl import APISchema, AuthSchema, DatabaseSchema, UISchema
-
-
-class RequirementsExtraction(BaseModel):
-    """Structured requirements document produced from a natural-language prompt."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    intent: str = Field(
-        description=(
-            "One-paragraph summary of the application's primary purpose and target users."
-        ),
-    )
-    functional_requirements: list[str] = Field(
-        description=(
-            "Discrete, testable functional requirements inferred from the prompt "
-            "(e.g. 'Users can register with email and password')."
-        ),
-    )
-    architectural_assumptions: list[str] = Field(
-        description=(
-            "Explicit technical assumptions the compiler should treat as fixed "
-            "(e.g. 'PostgreSQL persistence', 'Role-based access control', 'Streamlit UI')."
-        ),
-    )
-    entities: list[str] = Field(
-        description=(
-            "Core domain nouns/entities that likely become database tables "
-            "(e.g. 'user', 'order', 'product')."
-        ),
-    )
-    constraints: list[str] = Field(
-        description=(
-            "Non-functional constraints: security, scale, compliance, or UX limits "
-            "stated or strongly implied by the prompt."
-        ),
-    )
+from dsl import APISchema, AuthSchema, DatabaseSchema, RequirementsSchema, UISchema
+from compiler.schema_helpers import get_gemini_schema
 
 
 class BackendGenerationResult(BaseModel):
@@ -66,16 +29,19 @@ _REQUIREMENTS_SYSTEM = """\
 You are Stage 1 (Requirements Extraction) of an AI Software Compiler.
 
 Your job is to read a natural-language application request and produce a precise \
-requirements document. Do not invent features unrelated to the prompt, but do infer \
+RequirementsSchema. Do not invent features unrelated to the prompt, but do infer \
 reasonable defaults when the user omits implementation details (e.g. standard CRUD, login).
 
-Always assume the target stack unless the user overrides it:
+Populate:
+- features: testable functional capabilities
+- entities: domain nouns that become tables/resources (singular snake_case)
+- assumptions: stack and architecture choices (Python REST API, SQLite, Streamlit UI, RBAC)
+
+Always assume unless overridden:
 - Python backend with REST API
 - Relational database (tables with snake_case names)
 - Role-based authentication
 - Streamlit frontend (Forms, Tables, Text, Buttons)
-
-Be explicit in architectural_assumptions about anything you are inferring.
 """
 
 _BACKEND_SYSTEM = """\
@@ -106,8 +72,9 @@ Rules:
 - Every table should have appropriate REST endpoints (list, get by id, create, update, delete) \
 unless requirements explicitly exclude them.
 - Paths must start with '/' and use plural resource names (e.g. '/users', '/users/{user_id}').
-- request_schema and response_schema are JSON-Schema-like dicts keyed by field name; \
-values describe type and constraints (e.g. {"type": "string"}).
+- request_schema and response_schema are lists of SchemaField objects with field_name and field_type.
+- field_type must be one of: string, integer, number, boolean, array, object.
+- Use null for request_schema or response_schema when no fields apply.
 - Map request/response fields to actual database columns where applicable.
 - Include auth endpoints (register, login, me) when authentication is required.
 - requires_auth and required_roles must be consistent with the auth roles from requirements context.
@@ -124,17 +91,18 @@ Rules:
 - Component types are strictly: Text, Form, Table, Button.
 - Form, Table, and Button components MUST set api_endpoint_binding to an exact path from APISchema.
 - Text components may omit api_endpoint_binding when displaying static content.
-- payload_mapping links UI field ids to API request_schema keys for Forms and Buttons.
-- Tables typically bind to GET list endpoints with empty payload_mapping.
+- payload_mapping is a list of PayloadMapping objects (ui_input_name, api_field_name) for Forms and Buttons.
+- Use null for payload_mapping when no request body is sent (e.g. Table components).
+- Tables typically bind to GET list endpoints with null payload_mapping.
 - Provide sensible pages (home/dashboard, auth, resource management) and a nav_menu listing routes.
 - Routes must start with '/' and be unique.
 - Do not reference API paths that are not in the provided APISchema.
 """
 
 
-def extract_requirements(prompt: str) -> dict:
-    """Extract intent and explicit architectural assumptions from the raw user prompt."""
-    model = get_runtime().model
+def extract_requirements(prompt: str) -> RequirementsSchema:
+    """Extract structured requirements from the raw user prompt."""
+    runtime = get_runtime()
 
     user_message = f"""{_REQUIREMENTS_SYSTEM}
 
@@ -143,10 +111,11 @@ def extract_requirements(prompt: str) -> dict:
 """
 
     try:
-        result = generate_structured(
-            model,
+        return generate_structured(
+            runtime.client,
+            model=runtime.model_name,
             prompt=user_message,
-            response_schema=RequirementsExtraction,
+            response_schema=get_gemini_schema(RequirementsSchema),
         )
     except StructuredGenerationError:
         raise
@@ -155,14 +124,12 @@ def extract_requirements(prompt: str) -> dict:
             f"Requirements extraction failed: {exc}"
         ) from exc
 
-    return result.model_dump(mode="json")
 
-
-def generate_backend(requirements: dict) -> tuple[DatabaseSchema, AuthSchema]:
+def generate_backend(requirements: RequirementsSchema) -> tuple[DatabaseSchema, AuthSchema]:
     """Generate database and auth schemas from structured requirements."""
-    model = get_runtime().model
+    runtime = get_runtime()
 
-    requirements_json = json.dumps(requirements, indent=2)
+    requirements_json = requirements.model_dump_json(indent=2)
     user_message = f"""{_BACKEND_SYSTEM}
 
 --- REQUIREMENTS (Stage 1 output) ---
@@ -171,9 +138,10 @@ def generate_backend(requirements: dict) -> tuple[DatabaseSchema, AuthSchema]:
 
     try:
         result = generate_structured(
-            model,
+            runtime.client,
+            model=runtime.model_name,
             prompt=user_message,
-            response_schema=BackendGenerationResult,
+            response_schema=get_gemini_schema(BackendGenerationResult),
         )
     except StructuredGenerationError:
         raise
@@ -185,11 +153,11 @@ def generate_backend(requirements: dict) -> tuple[DatabaseSchema, AuthSchema]:
     return result.database, result.auth
 
 
-def generate_api(requirements: dict, db_schema: DatabaseSchema) -> APISchema:
+def generate_api(requirements: RequirementsSchema, db_schema: DatabaseSchema) -> APISchema:
     """Generate API routes strictly mapped to the provided database schema."""
-    model = get_runtime().model
+    runtime = get_runtime()
 
-    requirements_json = json.dumps(requirements, indent=2)
+    requirements_json = requirements.model_dump_json(indent=2)
     database_json = db_schema.model_dump_json(indent=2)
 
     user_message = f"""{_API_SYSTEM}
@@ -203,9 +171,10 @@ def generate_api(requirements: dict, db_schema: DatabaseSchema) -> APISchema:
 
     try:
         return generate_structured(
-            model,
+            runtime.client,
+            model=runtime.model_name,
             prompt=user_message,
-            response_schema=APISchema,
+            response_schema=get_gemini_schema(APISchema),
         )
     except StructuredGenerationError:
         raise
@@ -215,11 +184,11 @@ def generate_api(requirements: dict, db_schema: DatabaseSchema) -> APISchema:
         ) from exc
 
 
-def generate_ui(requirements: dict, api_schema: APISchema) -> UISchema:
+def generate_ui(requirements: RequirementsSchema, api_schema: APISchema) -> UISchema:
     """Generate Streamlit UI components bound to endpoints in the API schema."""
-    model = get_runtime().model
+    runtime = get_runtime()
 
-    requirements_json = json.dumps(requirements, indent=2)
+    requirements_json = requirements.model_dump_json(indent=2)
     api_json = api_schema.model_dump_json(indent=2)
 
     user_message = f"""{_UI_SYSTEM}
@@ -233,9 +202,10 @@ def generate_ui(requirements: dict, api_schema: APISchema) -> UISchema:
 
     try:
         return generate_structured(
-            model,
+            runtime.client,
+            model=runtime.model_name,
             prompt=user_message,
-            response_schema=UISchema,
+            response_schema=get_gemini_schema(UISchema),
         )
     except StructuredGenerationError:
         raise
