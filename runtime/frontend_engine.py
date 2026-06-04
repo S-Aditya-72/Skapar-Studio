@@ -56,7 +56,8 @@ if selection in pages:
             with st.form(key=comp["id"]):
                 inputs = {}
                 for mapping in comp.get("payload_mapping", []):
-                    inputs[mapping["ui_input_name"]] = st.text_input(
+                    # We display the UI name, but save it under the API field name!
+                    inputs[mapping["api_field_name"]] = st.text_input(
                         mapping["ui_input_name"])
 
                 submitted = st.form_submit_button("Submit")
@@ -66,6 +67,7 @@ if selection in pages:
                             res = requests.post(url, json=inputs)
                             st.success(
                                 f"Submitted to {endpoint}: {res.json()}")
+                            st.rerun()  # Refresh to show updated data
                         except Exception:
                             st.error("Failed to connect to backend")
 
